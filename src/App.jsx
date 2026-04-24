@@ -81,6 +81,16 @@ const T = {
     // Car detail labels
     color: "צבע", engineCC: "נפח מנוע (סמ״ק)", seats: "מספר מושבים",
     bodyType: "סוג גוף", fuelType: "סוג דלק", country: "מדינת ייצור",
+    // Maintenance & Fuel estimation
+    maintStatus: "סטטוס תחזוקה", maintOk: "תקין", maintDue: "נדרשת תחזוקה", maintOverdue: "תחזוקה באיחור",
+    nextService: "טיפול הבא בק״מ", lastService: "טיפול אחרון",
+    maintAlert: "🚗 הגיע זמן לטיפול!", maintQuestion: "האם בוצע טיפול כעת?",
+    maintLogged: "טיפול נרשם!", fuelEstTitle: "הערכת עלות דלק",
+    fuelEfficiency: "צריכת דלק", fuelEfficient: "חסכנית (16 ק״מ/ל׳)",
+    fuelAverage: "ממוצעת (12 ק״מ/ל׳)", fuelHigh: "גבוהה (8 ק״מ/ל׳)",
+    monthlyFuel: "עלות חודשית משוערת", yearlyFuel: "עלות שנתית משוערת",
+    avgMonthlyKm: "ק״מ חודשי ממוצע", noOdoData: "הוסף קריאת מד מרחק לחישוב",
+    serviceInterval: "כל 10,000 ק״מ",
   },
   ar: {
     dir: "rtl", appName: "تكلفة سيارتي", monthlyTotal: "التكلفة الشهرية", dailyCost: "التكلفة اليومية",
@@ -127,6 +137,16 @@ const T = {
     // Car detail labels
     color: "اللون", engineCC: "حجم المحرك (سم³)", seats: "عدد المقاعد",
     bodyType: "نوع الهيكل", fuelType: "نوع الوقود", country: "بلد الصنع",
+    // Maintenance & Fuel estimation
+    maintStatus: "حالة الصيانة", maintOk: "ممتاز", maintDue: "صيانة مستحقة", maintOverdue: "صيانة متأخرة",
+    nextService: "الخدمة التالية (كم)", lastService: "آخر خدمة",
+    maintAlert: "🚗 حان وقت الصيانة!", maintQuestion: "هل تمت الصيانة الآن؟",
+    maintLogged: "تم تسجيل الصيانة!", fuelEstTitle: "تقدير تكلفة الوقود",
+    fuelEfficiency: "استهلاك الوقود", fuelEfficient: "اقتصادي (16 كم/ل)",
+    fuelAverage: "متوسط (12 كم/ل)", fuelHigh: "مرتفع (8 كم/ل)",
+    monthlyFuel: "تكلفة شهرية تقديرية", yearlyFuel: "تكلفة سنوية تقديرية",
+    avgMonthlyKm: "متوسط الكم الشهري", noOdoData: "أضف قراءة العداد للحساب",
+    serviceInterval: "كل 10,000 كم",
   },
 };
 
@@ -134,7 +154,79 @@ const T = {
 const STORE_KEY = "carCostTracker_v3";
 function loadStore()    { try { const r=localStorage.getItem(STORE_KEY); return r?JSON.parse(r):null; } catch { return null; } }
 function saveStore(d)   { try { localStorage.setItem(STORE_KEY,JSON.stringify(d)); } catch {} }
-function initStore(lang){ return { version:3, language:lang||"ar", settings:{defaultFuelPrice:6.8}, expenses:[], car:null }; }
+function initStore(lang){ return { version:3, language:lang||"ar", settings:{defaultFuelPrice:6.8}, expenses:[], car:null, maintenance:[], fuelEfficiency:12 }; }
+
+// ── Maintenance helpers ───────────────────────────────────────────────────────
+const SERVICE_INTERVAL = 10000;
+
+function getMaintenanceStatus(store) {
+  const odomReadings = store.expenses
+    .filter(e => e.odometer)
+    .map(e => e.odometer)
+    .sort((a, b) => b - a);
+  const currentKm = odomReadings[0] || null;
+
+  const lastServiceKm = store.maintenance.length > 0
+    ? store.maintenance[store.maintenance.length - 1].km
+    : (store.car?.initialKm || null);
+
+  if (!currentKm) return { status: "unknown", currentKm: null, nextServiceKm: null, lastServiceKm };
+
+  const base = lastServiceKm || 0;
+  const nextServiceKm = base + SERVICE_INTERVAL;
+  const remaining = nextServiceKm - currentKm;
+
+  let status = "ok";
+  if (remaining <= 0) status = "overdue";
+  else if (remaining <= 1500) status = "due";
+
+  return { status, currentKm, nextServiceKm, lastServiceKm: base, remaining };
+}
+
+// ── Fuel estimation helpers ───────────────────────────────────────────────────
+const EFFICIENCY_MAP = { 16: "efficient", 12: "average", 8: "high" };
+// Simple model → efficiency hints (km/L)
+const MODEL_EFFICIENCY = {
+  "hybrid": 18, "yaris": 16, "jazz": 16, "fiesta": 15, "polo": 14,
+  "corolla": 13, "civic": 13, "focus": 13, "golf": 12, "astra": 12,
+  "mazda3": 12, "i20": 14, "i30": 13, "elantra": 12,
+  "kuga": 10, "tiguan": 10, "rav4": 10, "tucson": 10, "qashqai": 11,
+  "x5": 8, "x6": 8, "mustang": 8, "camaro": 8,
+};
+
+function guessEfficiency(model) {
+  if (!model) return null;
+  const lower = model.toLowerCase();
+  for (const [key, val] of Object.entries(MODEL_EFFICIENCY)) {
+    if (lower.includes(key)) return val;
+  }
+  return null;
+}
+
+function calcFuelCost(store) {
+  // Estimate monthly km from odometer readings
+  const readings = store.expenses
+    .filter(e => e.odometer)
+    .map(e => ({ km: e.odometer, date: new Date(e.date) }))
+    .sort((a, b) => a.date - b.date);
+
+  let monthlyKm = null;
+  if (readings.length >= 2) {
+    const first = readings[0], last = readings[readings.length - 1];
+    const months = Math.max(1, (last.date - first.date) / (1000 * 60 * 60 * 24 * 30));
+    monthlyKm = Math.round((last.km - first.km) / months);
+  }
+
+  const efficiency = store.fuelEfficiency || 12;
+  const fuelPrice  = store.settings.defaultFuelPrice || 6.8;
+
+  if (!monthlyKm || monthlyKm <= 0) return { monthlyKm: null, monthlyFuel: null, yearlyFuel: null };
+
+  const monthlyLiters = monthlyKm / efficiency;
+  const monthlyFuel   = Math.round(monthlyLiters * fuelPrice);
+  const yearlyFuel    = monthlyFuel * 12;
+  return { monthlyKm, monthlyFuel, yearlyFuel };
+}
 function getCurrentMonth(){ const n=new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}`; }
 function fmtNum(n) { return new Intl.NumberFormat("he-IL",{maximumFractionDigits:0}).format(Math.round(n)); }
 function fmtDec(n) { return new Intl.NumberFormat("he-IL",{minimumFractionDigits:1,maximumFractionDigits:1}).format(n); }
@@ -501,7 +593,7 @@ function Onboarding({ t, onDone, onLangToggle }) {
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [store,      setStore]      = useState(()=>loadStore()||initStore("ar"));
+  const [store,      setStore]      = useState(()=>{ const s=loadStore()||initStore("ar"); if(!s.maintenance)s.maintenance=[]; if(!s.fuelEfficiency)s.fuelEfficiency=12; return s; });
   const [modal,      setModal]      = useState(null);
   const [addStep,    setAddStep]    = useState("type");
   const [addType,    setAddType]    = useState(null);
@@ -511,6 +603,7 @@ export default function App() {
   const [settingsFP, setSettingsFP] = useState("");
   const [pulse,      setPulse]      = useState(false);
   const [exporting,  setExporting]  = useState(false);
+  const [maintAlertDismissed, setMaintAlertDismissed] = useState(false);
 
   const t = T[store.language];
   useEffect(()=>{ saveStore(store); document.documentElement.setAttribute("dir",t.dir); },[store]);
@@ -528,6 +621,20 @@ export default function App() {
 
   const openAdd   = ()=>{setAddStep("type");setAddType(null);setForm({amount:"",liters:"",fuelPrice:store.settings.defaultFuelPrice.toString(),description:"",odometer:""});setDescErr(false);setModal("add");};
   const fuelTotal = (()=>{const l=parseFloat(form.liters),p=parseFloat(form.fuelPrice);return(!isNaN(l)&&!isNaN(p)&&l>0)?l*p:null;})();
+
+  // Maintenance & Fuel derived
+  const maintInfo  = getMaintenanceStatus(store);
+  const fuelEst    = calcFuelCost(store);
+  const showMaintAlert = !maintAlertDismissed && (maintInfo.status === "due" || maintInfo.status === "overdue") && modal === null;
+
+  const logService = () => {
+    const km = maintInfo.currentKm || 0;
+    const entry = { id: uid(), date: new Date().toISOString(), km, description: "Service logged" };
+    setStore(s => ({ ...s, maintenance: [...(s.maintenance || []), entry] }));
+    setMaintAlertDismissed(true);
+  };
+
+  const setFuelEfficiency = (val) => setStore(s => ({ ...s, fuelEfficiency: val }));
 
   const handleAdd = ()=>{
     if(addType==="maintenance"&&!form.description.trim()){setDescErr(true);return;}
@@ -606,7 +713,56 @@ export default function App() {
         })}
       </div>
 
-      {/* Recent */}
+      {/* ── Maintenance Status Card ── */}
+      {maintInfo.status !== "unknown" && (
+        <div style={{padding:"14px 16px 0"}}>
+          <div style={{background:"#fff",borderRadius:18,padding:"14px 16px",boxShadow:"0 2px 12px rgba(0,0,0,0.05)",display:"flex",alignItems:"center",gap:12}}>
+            <div style={{width:44,height:44,borderRadius:14,background:maintInfo.status==="ok"?"#F0FDF4":maintInfo.status==="due"?"#FFFBEB":"#FFF1F2",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>
+              {maintInfo.status==="ok"?"✅":maintInfo.status==="due"?"⚠️":"🔴"}
+            </div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94A3B8",textTransform:"uppercase",letterSpacing:"0.3px",marginBottom:2}}>{t.maintStatus}</div>
+              <div style={{fontSize:15,fontWeight:800,color:maintInfo.status==="ok"?"#15803D":maintInfo.status==="due"?"#B45309":"#DC2626"}}>
+                {t[maintInfo.status==="ok"?"maintOk":maintInfo.status==="due"?"maintDue":"maintOverdue"]}
+              </div>
+              <div style={{fontSize:11,color:"#64748B",marginTop:2}}>
+                {t.nextService}: {(maintInfo.nextServiceKm||0).toLocaleString()} {t.km}
+                {maintInfo.remaining > 0 && ` (${maintInfo.remaining.toLocaleString()} ${t.km})`}
+              </div>
+            </div>
+            <div style={{fontSize:10,fontWeight:600,color:"#CBD5E1",textAlign:"center",flexShrink:0}}>{t.serviceInterval}</div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Fuel Estimate Card ── */}
+      <div style={{padding:"14px 16px 0"}}>
+        <div style={{background:"#fff",borderRadius:18,padding:"16px",boxShadow:"0 2px 12px rgba(0,0,0,0.05)"}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#94A3B8",textTransform:"uppercase",letterSpacing:"0.3px",marginBottom:10}}>{t.fuelEstTitle}</div>
+          {/* Efficiency selector */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:12}}>
+            {[{val:16,label:t.fuelEfficient},{val:12,label:t.fuelAverage},{val:8,label:t.fuelHigh}].map(opt=>(
+              <button key={opt.val} onClick={()=>setFuelEfficiency(opt.val)} style={{padding:"8px 4px",borderRadius:12,border:`2px solid ${store.fuelEfficiency===opt.val?"#3B82F6":"#E2E8F0"}`,background:store.fuelEfficiency===opt.val?"#EFF6FF":"#F8FAFC",color:store.fuelEfficiency===opt.val?"#1D4ED8":"#64748B",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit",lineHeight:1.4,textAlign:"center"}}>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          {fuelEst.monthlyFuel ? (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <div style={{background:"#EFF6FF",borderRadius:12,padding:"10px 12px"}}>
+                <div style={{fontSize:10,color:"#2563EB",fontWeight:600,marginBottom:3}}>{t.monthlyFuel}</div>
+                <div style={{fontSize:20,fontWeight:800,color:"#1D4ED8"}}>{t.currency}{(fuelEst.monthlyFuel).toLocaleString()}</div>
+              </div>
+              <div style={{background:"#F0FDF4",borderRadius:12,padding:"10px 12px"}}>
+                <div style={{fontSize:10,color:"#15803D",fontWeight:600,marginBottom:3}}>{t.yearlyFuel}</div>
+                <div style={{fontSize:20,fontWeight:800,color:"#15803D"}}>{t.currency}{(fuelEst.yearlyFuel).toLocaleString()}</div>
+              </div>
+            </div>
+          ) : (
+            <div style={{fontSize:12,color:"#94A3B8",textAlign:"center",padding:"8px 0"}}>{t.noOdoData}</div>
+          )}
+        </div>
+      </div>
       <div style={{padding:"18px 16px 0"}}>
         <p style={{fontSize:11,fontWeight:700,color:"#94A3B8",marginBottom:10,letterSpacing:"0.8px",textTransform:"uppercase"}}>{t.recentEntries}</p>
         {recent.length===0?(
@@ -644,6 +800,28 @@ export default function App() {
         <span style={{fontSize:22,fontWeight:300}}>+</span>
         {t.addExpense}
       </button>
+
+      {/* ── Maintenance Alert Modal ── */}
+      {showMaintAlert && (
+        <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.55)",backdropFilter:"blur(4px)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{direction:t.dir,background:"#fff",borderRadius:24,padding:"28px 24px",width:"100%",maxWidth:380,boxShadow:"0 24px 64px rgba(0,0,0,0.18)",animation:"fadeIn 0.2s ease"}}>
+            <div style={{textAlign:"center",marginBottom:20}}>
+              <div style={{fontSize:52,marginBottom:12}}>🔧</div>
+              <h2 style={{fontSize:20,fontWeight:800,color:"#0F172A",margin:"0 0 8px",letterSpacing:"-0.5px"}}>{t.maintAlert}</h2>
+              <p style={{fontSize:14,color:"#64748B",margin:0}}>{t.maintQuestion}</p>
+              {maintInfo.currentKm && (
+                <p style={{fontSize:12,color:"#94A3B8",margin:"8px 0 0"}}>
+                  {t.nextService}: {(maintInfo.nextServiceKm||0).toLocaleString()} {t.km} · {t.serviceInterval}
+                </p>
+              )}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <button onClick={()=>setMaintAlertDismissed(true)} style={{padding:"14px",background:"#F1F5F9",border:"none",borderRadius:14,fontSize:15,fontWeight:700,color:"#64748B",cursor:"pointer",fontFamily:"inherit"}}>{t.no}</button>
+              <button onClick={logService} style={{padding:"14px",background:"linear-gradient(135deg,#1D4ED8,#3B82F6)",border:"none",borderRadius:14,fontSize:15,fontWeight:700,color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>{t.yes}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* MODALS */}
       {modal&&(
